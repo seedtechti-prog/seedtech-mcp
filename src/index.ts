@@ -8,19 +8,21 @@ import {
 import { z } from "zod";
 import { promises as fs } from "fs";
 import path from "path";
-import { exec, execSync } from "child_process";
+import { exec, execSync, ChildProcess } from "child_process";
 import os from "os";
 import AdmZip from "adm-zip";
 import * as pdfParse from "pdf-parse";
+import * as sqlite3Module from "sqlite3";
 
 // Tratamento especial para import de CommonJS no ESM
 const parsePdf = (pdfParse as any).default || pdfParse;
+const sqlite3 = (sqlite3Module as any).default || sqlite3Module;
 
 // Instanciando o Servidor MCP
 const server = new Server(
   {
     name: "seed-tech-mcp",
-    version: "1.3.0",
+    version: "1.4.0",
   },
   {
     capabilities: {
@@ -178,6 +180,154 @@ const ALLOWED_COMMANDS = [
   "git diff"
 ];
 
+// -------------------------------------------------------------
+// 5. Sistema de Auditoria Geral (mcp_audit.log)
+// -------------------------------------------------------------
+async function logAudit(action: string, details: any, sessionId = "system") {
+  try {
+    const logPath = path.resolve(process.cwd(), "mcp_audit.log");
+    const entry = JSON.stringify({
+      timestamp: new Date().toISOString(),
+      action,
+      sessionId,
+      details
+    }) + "\n";
+    await fs.appendFile(logPath, entry, "utf-8");
+  } catch (e) {
+    console.error("Erro ao escrever no log de auditoria:", e);
+  }
+}
+
+// -------------------------------------------------------------
+// 6. Fila de Tarefas Assíncronas (Job Queue)
+// -------------------------------------------------------------
+interface BackgroundJob {
+  id: string;
+  process: ChildProcess;
+  status: "running" | "completed" | "failed" | "cancelled";
+  command: string;
+  logs: string[];
+}
+
+const backgroundJobs = new Map<string, BackgroundJob>();
+
+// -------------------------------------------------------------
+// 7. Motor de Busca Semântica Local (TF-IDF Inteligente)
+// -------------------------------------------------------------
+interface DocumentToken {
+  filePath: string;
+  tokens: string[];
+  tf: Map<string, number>;
+}
+
+async function getFilesInDirectory(dir: string, fileList: string[] = []) {
+  try {
+    const entries = await fs.readdir(dir, { withFileTypes: true });
+    for (const entry of entries) {
+      if (shouldIgnoreDirectory(entry.name)) continue;
+      const fullPath = path.join(dir, entry.name);
+      if (isSensitive(fullPath)) continue;
+      if (entry.isDirectory()) {
+        await getFilesInDirectory(fullPath, fileList);
+      } else if (entry.isFile()) {
+        const ext = path.extname(entry.name).toLowerCase();
+        const readableExts = [".ts", ".js", ".json", ".md", ".txt", ".html", ".css", ".yml", ".yaml"];
+        if (readableExts.includes(ext)) {
+          fileList.push(fullPath);
+        }
+      }
+    }
+  } catch (e) {
+    // Ignora
+  }
+  return fileList;
+}
+
+function tokenize(text: string): string[] {
+  return text
+    .toLowerCase()
+    .replace(/[^\w\s]/g, " ")
+    .split(/\s+/)
+    .filter(t => t.length > 2);
+}
+
+async function semanticSearch(dirPath: string, query: string): Promise<any[]> {
+  const files = await getFilesInDirectory(dirPath);
+  const docs: DocumentToken[] = [];
+  const df = new Map<string, number>();
+
+  for (const file of files) {
+    try {
+      const content = await fs.readFile(file, "utf-8");
+      const tokens = tokenize(content);
+      if (tokens.length === 0) continue;
+      
+      const tf = new Map<string, number>();
+      tokens.forEach(token => {
+        tf.set(token, (tf.get(token) || 0) + 1);
+      });
+
+      tf.forEach((count, token) => {
+        tf.set(token, count / tokens.length);
+      });
+
+      docs.push({ filePath: file, tokens, tf });
+
+      const uniqueTokens = new Set(tokens);
+      uniqueTokens.forEach(token => {
+        df.set(token, (df.get(token) || 0) + 1);
+      });
+    } catch (e) {
+      // Ignora ilegíveis
+    }
+  }
+
+  const queryTokens = tokenize(query);
+  if (queryTokens.length === 0 || docs.length === 0) return [];
+
+  const results: { filePath: string; score: number; snippet: string }[] = [];
+
+  docs.forEach(doc => {
+    let score = 0;
+    queryTokens.forEach(token => {
+      const tf = doc.tf.get(token) || 0;
+      if (tf > 0) {
+        const docFreq = df.get(token) || 1;
+        const idf = Math.log(docs.length / docFreq) + 1;
+        score += tf * idf;
+      }
+    });
+
+    if (score > 0) {
+      results.push({
+        filePath: doc.filePath,
+        score: score,
+        snippet: ""
+      });
+    }
+  });
+
+  results.sort((a, b) => b.score - a.score);
+
+  const topResults = results.slice(0, 5);
+  for (const res of topResults) {
+    try {
+      const content = await fs.readFile(res.filePath, "utf-8");
+      const lines = content.split(/\r?\n/);
+      let bestLine = lines[0] || "";
+      for (const line of lines) {
+        if (queryTokens.some(token => line.toLowerCase().includes(token))) {
+          bestLine = line.trim();
+          break;
+        }
+      }
+      res.snippet = bestLine.slice(0, 150);
+    } catch (e) {}
+  }
+
+  return topResults;
+}
+
 // Schemas do Zod para validar argumentos
 const ListDirectorySchema = z.object({
   dirPath: z.string().describe("Caminho absoluto do diretório para listar"),
@@ -229,7 +379,7 @@ const RunSafeCommandSchema = z.object({
 
 const ZipDirectorySchema = z.object({
   dirPath: z.string().describe("Caminho absoluto da pasta a ser compactada"),
-  zipFilePath: z.string().describe("Caminho absoluto do arquivo .zip resultante"),
+  zipFilePath: z.string().describe("Caminho absoluto del arquivo .zip resultante"),
 });
 
 const UnzipFileSchema = z.object({
@@ -239,6 +389,37 @@ const UnzipFileSchema = z.object({
 
 const ReadPdfTextSchema = z.object({
   filePath: z.string().describe("Caminho absoluto do arquivo PDF"),
+});
+
+const QuerySqliteSchema = z.object({
+  dbPath: z.string().describe("Caminho absoluto do arquivo de banco de dados SQLite (.db ou .sqlite)"),
+  sqlQuery: z.string().describe("A consulta SQL SELECT a ser executada"),
+});
+
+const FetchWebContentSchema = z.object({
+  url: z.string().describe("A URL do site ou documentação para requisitar"),
+});
+
+const SearchSemanticSchema = z.object({
+  dirPath: z.string().describe("Caminho absoluto do diretório inicial"),
+  query: z.string().describe("A consulta conceitual/semântica a ser buscada (ex: 'validador de chaves de api')"),
+});
+
+const StartBackgroundJobSchema = z.object({
+  command: z.string().describe("O comando do terminal a ser iniciado em background"),
+  cwd: z.string().describe("Diretório de trabalho para execução do job"),
+});
+
+const CheckJobStatusSchema = z.object({
+  jobId: z.string().describe("O ID do job retornado ao iniciar"),
+});
+
+const CancelJobSchema = z.object({
+  jobId: z.string().describe("O ID do job para cancelar"),
+});
+
+const GetAuditLogsSchema = z.object({
+  linesLimit: z.number().optional().describe("Limite opcional de logs recentes a ler"),
 });
 
 // Registrando as ferramentas disponíveis
@@ -296,7 +477,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "write_file",
-        description: "Cria ou sobrescreve por completo o conteúdo de um arquivo (invalida caches automaticamente).",
+        description: "Cria ou sobrescreve por completo o conteúdo de um arquivo (invalida caches e gera auditoria automaticamente).",
         inputSchema: {
           type: "object",
           properties: {
@@ -308,7 +489,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "edit_file",
-        description: "Realiza a edição pontual de um arquivo substituindo uma string exclusiva (invalida caches automaticamente).",
+        description: "Realiza a edição pontual de um arquivo substituindo uma string exclusiva (invalida caches e gera auditoria automaticamente).",
         inputSchema: {
           type: "object",
           properties: {
@@ -333,7 +514,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "update_json_property",
-        description: "Altera ou adiciona cirurgicamente um valor a uma propriedade de um JSON (invalida caches automaticamente).",
+        description: "Altera ou adiciona cirurgicamente um valor a uma propriedade de um JSON (invalida caches e gera auditoria automaticamente).",
         inputSchema: {
           type: "object",
           properties: {
@@ -354,7 +535,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "run_safe_command",
-        description: "Executa comandos do terminal de forma segura. Se o Docker estiver rodando, executa em sandbox 100% isolado sem limites de comandos.",
+        description: "Executa comandos do terminal de forma síncrona. Se o Docker estiver rodando, executa em sandbox 100% isolado sem limites de comandos.",
         inputSchema: {
           type: "object",
           properties: {
@@ -397,6 +578,85 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             filePath: { type: "string", description: "Caminho absoluto do arquivo PDF" }
           },
           required: ["filePath"]
+        }
+      },
+      {
+        name: "query_sqlite",
+        description: "Executa consultas SQL SELECT em um banco de dados SQLite local de forma segura e somente-leitura.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            dbPath: { type: "string", description: "Caminho absoluto do arquivo SQLite" },
+            sqlQuery: { type: "string", description: "A consulta SELECT a ser realizada" }
+          },
+          required: ["dbPath", "sqlQuery"]
+        }
+      },
+      {
+        name: "fetch_web_content",
+        description: "Faz requisições GET HTTP seguras para ler documentações ou baixar dados diretamente da web.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            url: { type: "string", description: "A URL completa para requisitar" }
+          },
+          required: ["url"]
+        }
+      },
+      {
+        name: "search_semantic",
+        description: "Realiza busca semântica conceitual inteligente nos arquivos legíveis locais usando TF-IDF local.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            dirPath: { type: "string", description: "Caminho absoluto do diretório inicial" },
+            query: { type: "string", description: "A frase ou contexto conceitual a ser buscado" }
+          },
+          required: ["dirPath", "query"]
+        }
+      },
+      {
+        name: "start_background_job",
+        description: "Inicia a execução de um comando longo em background, retornando um ID para acompanhamento.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            command: { type: "string", description: "O comando a ser executado" },
+            cwd: { type: "string", description: "Diretório de trabalho" }
+          },
+          required: ["command", "cwd"]
+        }
+      },
+      {
+        name: "check_job_status",
+        description: "Checa o progresso, status atual e logs acumulados (stdout/stderr) de um job em background.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            jobId: { type: "string", description: "O ID do job retornado ao iniciar" }
+          },
+          required: ["jobId"]
+        }
+      },
+      {
+        name: "cancel_job",
+        description: "Interrompe e cancela imediatamente a execução de um job rodando em background.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            jobId: { type: "string", description: "O ID do job para cancelar" }
+          },
+          required: ["jobId"]
+        }
+      },
+      {
+        name: "get_audit_logs",
+        description: "Recupera os registros recentes do log de auditoria estruturado local.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            linesLimit: { type: "number", description: "Limite opcional de linhas recentes a carregar" }
+          }
         }
       }
     ],
@@ -485,6 +745,7 @@ async function searchContentRecursive(
 // Lidando com a execução das ferramentas
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
+  const sessionId = (request.params as any).sessionId || "default";
 
   try {
     if (name === "list_directory") {
@@ -601,8 +862,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       await fs.mkdir(path.dirname(validatedFile), { recursive: true });
       await fs.writeFile(validatedFile, content, "utf-8");
       
-      // Invalida cache
       smartCache.invalidate(validatedFile);
+      await logAudit("write_file", { filePath: validatedFile }, sessionId);
 
       return {
         content: [{ type: "text", text: `Arquivo escrito com sucesso em: ${validatedFile}` }],
@@ -626,8 +887,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const updatedContent = fileContent.replace(targetContent, replacementContent);
       await fs.writeFile(validatedFile, updatedContent, "utf-8");
       
-      // Invalida cache
       smartCache.invalidate(validatedFile);
+      await logAudit("edit_file", { filePath: validatedFile }, sessionId);
 
       return {
         content: [{ type: "text", text: `Arquivo editado com sucesso. Substituição pontual realizada.` }],
@@ -638,7 +899,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const { filePath, propertyPath } = ReadJsonPropertySchema.parse(args);
       const validatedFile = validatePath(filePath);
       
-      // Tenta puxar do cache o arquivo completo
       let fileContent = smartCache.get(validatedFile);
       if (!fileContent) {
         fileContent = await fs.readFile(validatedFile, "utf-8");
@@ -665,6 +925,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       
       await fs.writeFile(validatedFile, updatedContent, "utf-8");
       smartCache.invalidate(validatedFile);
+      await logAudit("update_json_property", { filePath: validatedFile, propertyPath }, sessionId);
 
       return {
         content: [{ type: "text", text: `Propriedade '${propertyPath}' do JSON atualizada com sucesso.` }],
@@ -694,16 +955,16 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       let finalCommand = cleanCmd;
 
       if (IS_DOCKER_AVAILABLE) {
-        // Docker Sandbox: Executa qualquer comando de forma 100% isolada e segura
         const absoluteCwd = path.resolve(validatedCwd);
         const dockerCwd = absoluteCwd.replace(/\\/g, "/");
         finalCommand = `docker run --rm -v "${dockerCwd}:/workspace" -w /workspace node:18-alpine sh -c "${cleanCmd.replace(/"/g, '\\"')}"`;
       } else {
-        // Fallback Local: Restrição rígida apenas a comandos permitidos
         if (!ALLOWED_COMMANDS.includes(cleanCmd)) {
           throw new Error(`Comando rejeitado por segurança (Docker inativo). No modo local, apenas os seguintes comandos são permitidos: ${ALLOWED_COMMANDS.join(", ")}`);
         }
       }
+
+      await logAudit("run_safe_command", { command: cleanCmd, finalCommand, isDocker: IS_DOCKER_AVAILABLE }, sessionId);
 
       const runPromise = () => new Promise<string>((resolve, reject) => {
         exec(finalCommand, { cwd: validatedCwd }, (error, stdout, stderr) => {
@@ -731,6 +992,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       zip.writeZip(validatedZip);
       
       smartCache.invalidate(validatedZip);
+      await logAudit("zip_directory", { dirPath: validatedDir, zipFilePath: validatedZip }, sessionId);
 
       return {
         content: [{ type: "text", text: `Diretório compactado com sucesso em: ${validatedZip}` }],
@@ -746,6 +1008,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       zip.extractAllTo(validatedDest, true);
       
       smartCache.invalidate(validatedDest);
+      await logAudit("unzip_file", { zipFilePath: validatedZip, destDirPath: validatedDest }, sessionId);
 
       return {
         content: [{ type: "text", text: `Arquivo ZIP extraído com sucesso em: ${validatedDest}` }],
@@ -762,6 +1025,164 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       return {
         content: [{ type: "text", text: pdfData.text }],
       };
+    }
+
+    if (name === "query_sqlite") {
+      const { dbPath, sqlQuery } = QuerySqliteSchema.parse(args);
+      const validatedDb = validatePath(dbPath);
+      
+      if (!sqlQuery.trim().toLowerCase().startsWith("select")) {
+        throw new Error("Acesso negado: Apenas comandos SELECT são permitidos para garantir a segurança.");
+      }
+
+      await logAudit("query_sqlite", { dbPath: validatedDb, sqlQuery }, sessionId);
+
+      const runQuery = () => new Promise<any[]>((resolve, reject) => {
+        const db = new sqlite3.Database(validatedDb, sqlite3.OPEN_READONLY, (err: any) => {
+          if (err) return reject(new Error(`Erro ao abrir o banco de dados: ${err.message}`));
+        });
+
+        db.all(sqlQuery, [], (err: any, rows: any[]) => {
+          db.close();
+          if (err) return reject(new Error(`Erro na query SQL: ${err.message}`));
+          resolve(rows);
+        });
+      });
+
+      const rows = await runQuery();
+      return {
+        content: [{ type: "text", text: JSON.stringify(rows, null, 2) }],
+      };
+    }
+
+    if (name === "fetch_web_content") {
+      const { url } = FetchWebContentSchema.parse(args);
+      await logAudit("fetch_web_content", { url }, sessionId);
+
+      const response = await fetch(url);
+      if (!response.ok) {
+        throw new Error(`Falha na requisição web: status ${response.status}`);
+      }
+      const text = await response.text();
+      return {
+        content: [{ type: "text", text: text.slice(0, 100000) }], // Retorna até 100kb
+      };
+    }
+
+    if (name === "search_semantic") {
+      const { dirPath, query } = SearchSemanticSchema.parse(args);
+      const validatedDir = validatePath(dirPath);
+      const matches = await semanticSearch(validatedDir, query);
+      return {
+        content: [{ type: "text", text: JSON.stringify(matches, null, 2) }],
+      };
+    }
+
+    if (name === "start_background_job") {
+      const { command, cwd } = StartBackgroundJobSchema.parse(args);
+      const cleanCmd = command.trim();
+      const validatedCwd = validatePath(cwd);
+      const jobId = "job_" + Math.random().toString(36).substring(2, 11);
+
+      let finalCommand = cleanCmd;
+      let argsList: string[] = [];
+
+      if (IS_DOCKER_AVAILABLE) {
+        const absoluteCwd = path.resolve(validatedCwd);
+        const dockerCwd = absoluteCwd.replace(/\\/g, "/");
+        // Para rodar em background sob exec, podemos passar direto o comando do Docker
+        finalCommand = `docker run --rm -v "${dockerCwd}:/workspace" -w /workspace node:18-alpine sh -c "${cleanCmd.replace(/"/g, '\\"')}"`;
+      } else {
+        if (!ALLOWED_COMMANDS.includes(cleanCmd)) {
+          throw new Error(`Comando background rejeitado por segurança (Docker inativo). No modo local, apenas os seguintes comandos são permitidos: ${ALLOWED_COMMANDS.join(", ")}`);
+        }
+      }
+
+      await logAudit("start_background_job", { jobId, command: cleanCmd, finalCommand }, sessionId);
+
+      // Inicia o processo assíncrono
+      const proc = exec(finalCommand, { cwd: validatedCwd });
+      const job: BackgroundJob = {
+        id: jobId,
+        process: proc,
+        status: "running",
+        command: cleanCmd,
+        logs: []
+      };
+
+      backgroundJobs.set(jobId, job);
+
+      proc.stdout?.on("data", (data) => {
+        job.logs.push(`[STDOUT] ${data}`);
+      });
+
+      proc.stderr?.on("data", (data) => {
+        job.logs.push(`[STDERR] ${data}`);
+      });
+
+      proc.on("close", (code) => {
+        job.status = code === 0 ? "completed" : "failed";
+        job.logs.push(`[PROCESS CLOSED] Código de saída: ${code}`);
+      });
+
+      return {
+        content: [{ type: "text", text: JSON.stringify({ jobId, status: "running" }, null, 2) }],
+      };
+    }
+
+    if (name === "check_job_status") {
+      const { jobId } = CheckJobStatusSchema.parse(args);
+      const job = backgroundJobs.get(jobId);
+      if (!job) {
+        throw new Error(`Job com ID '${jobId}' não encontrado.`);
+      }
+      return {
+        content: [{
+          type: "text",
+          text: JSON.stringify({
+            jobId: job.id,
+            command: job.command,
+            status: job.status,
+            logs: job.logs.slice(-100) // Retorna as últimas 100 linhas de logs
+          }, null, 2)
+        }],
+      };
+    }
+
+    if (name === "cancel_job") {
+      const { jobId } = CancelJobSchema.parse(args);
+      const job = backgroundJobs.get(jobId);
+      if (!job) {
+        throw new Error(`Job com ID '${jobId}' não encontrado.`);
+      }
+      if (job.status === "running") {
+        job.process.kill();
+        job.status = "cancelled";
+        job.logs.push("[PROCESS KILLED BY USER]");
+      }
+      await logAudit("cancel_job", { jobId }, sessionId);
+      return {
+        content: [{ type: "text", text: `Job '${jobId}' cancelado e encerrado com sucesso.` }],
+      };
+    }
+
+    if (name === "get_audit_logs") {
+      const { linesLimit } = GetAuditLogsSchema.parse(args);
+      const limit = linesLimit || 50;
+      const logPath = path.resolve(process.cwd(), "mcp_audit.log");
+      
+      try {
+        const content = await fs.readFile(logPath, "utf-8");
+        const lines = content.trim().split("\n");
+        const recent = lines.slice(-limit).map(l => JSON.parse(l));
+        return {
+          content: [{ type: "text", text: JSON.stringify(recent, null, 2) }],
+        };
+      } catch (err) {
+        return {
+          content: [{ type: "text", text: "Nenhum log de auditoria encontrado ainda." }],
+        };
+      }
     }
 
     throw new Error(`Tool desconhecida: ${name}`);
