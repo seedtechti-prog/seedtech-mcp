@@ -7,12 +7,14 @@ import {
 import { z } from "zod";
 import { promises as fs } from "fs";
 import path from "path";
+import { exec } from "child_process";
+import os from "os";
 
 // Instanciando o Servidor MCP
 const server = new Server(
   {
     name: "seed-tech-mcp",
-    version: "1.1.0",
+    version: "1.2.0",
   },
   {
     capabilities: {
@@ -32,11 +34,47 @@ if (!ALLOWED_DIRECTORIES) {
   console.error(`Segurança Sandbox Ativa. Diretórios permitidos: ${ALLOWED_DIRECTORIES.join(", ")}`);
 }
 
+// -------------------------------------------------------------
+// 1. Ignore List (Lista de Exclusão Padrão)
+// -------------------------------------------------------------
+const SENSITIVE_PATTERNS = [
+  /\.env$/i,
+  /\.pem$/i,
+  /\.key$/i,
+  /id_rsa$/i,
+  /id_dsa$/i,
+  /id_ecdsa$/i,
+  /id_ed25519$/i
+];
+
+const IGNORED_DIRECTORIES = [
+  "node_modules",
+  ".git",
+  ".github",
+  ".vscode",
+  "dist",
+  "build"
+];
+
+function isSensitive(filePath: string): boolean {
+  const base = path.basename(filePath);
+  return SENSITIVE_PATTERNS.some(regex => regex.test(base));
+}
+
+function shouldIgnoreDirectory(dirName: string): boolean {
+  return IGNORED_DIRECTORIES.includes(dirName.toLowerCase());
+}
+
 /**
- * Valida se o caminho está dentro das pastas permitidas, se aplicável.
+ * Valida se o caminho está dentro das pastas permitidas e se não acessa arquivos sensíveis.
  */
 function validatePath(targetPath: string): string {
   const resolved = path.resolve(targetPath);
+  
+  if (isSensitive(resolved)) {
+    throw new Error(`Acesso negado: O arquivo '${path.basename(resolved)}' contém dados sensíveis e é protegido.`);
+  }
+
   if (ALLOWED_DIRECTORIES) {
     const isAllowed = ALLOWED_DIRECTORIES.some(dir => resolved.startsWith(dir));
     if (!isAllowed) {
@@ -45,6 +83,82 @@ function validatePath(targetPath: string): string {
   }
   return resolved;
 }
+
+// -------------------------------------------------------------
+// 2. Cache em Memória Inteligente (TTL 15 segundos)
+// -------------------------------------------------------------
+interface CacheEntry {
+  data: any;
+  timestamp: number;
+}
+
+class InMemoryCache {
+  private cache = new Map<string, CacheEntry>();
+  private ttlMs = 15000; // 15 segundos
+
+  get(key: string): any | null {
+    const entry = this.cache.get(key);
+    if (!entry) return null;
+    if (Date.now() - entry.timestamp > this.ttlMs) {
+      this.cache.delete(key);
+      return null;
+    }
+    return entry.data;
+  }
+
+  set(key: string, data: any): void {
+    this.cache.set(key, { data, timestamp: Date.now() });
+  }
+
+  invalidate(key: string): void {
+    const resolvedKey = path.resolve(key);
+    this.cache.delete(resolvedKey);
+    // Limpa também o diretório pai
+    const parentDir = path.dirname(resolvedKey);
+    this.cache.delete(parentDir);
+  }
+}
+
+const smartCache = new InMemoryCache();
+
+// -------------------------------------------------------------
+// 3. Auxiliares para Cirurgia JSON
+// -------------------------------------------------------------
+function getNestedProperty(obj: any, propPath: string): any {
+  const parts = propPath.split(".");
+  let current = obj;
+  for (const part of parts) {
+    if (current === null || typeof current !== "object" || !(part in current)) {
+      return undefined;
+    }
+    current = current[part];
+  }
+  return current;
+}
+
+function setNestedProperty(obj: any, propPath: string, value: any): void {
+  const parts = propPath.split(".");
+  let current = obj;
+  for (let i = 0; i < parts.length - 1; i++) {
+    const part = parts[i];
+    if (!(part in current) || typeof current[part] !== "object" || current[part] === null) {
+      current[part] = {};
+    }
+    current = current[part];
+  }
+  current[parts[parts.length - 1]] = value;
+}
+
+// -------------------------------------------------------------
+// 4. Safe Command Runner Configuration
+// -------------------------------------------------------------
+const ALLOWED_COMMANDS = [
+  "npm test",
+  "npm run test",
+  "npm run build",
+  "git status",
+  "git diff"
+];
 
 // Schemas do Zod para validar argumentos
 const ListDirectorySchema = z.object({
@@ -79,13 +193,29 @@ const EditFileSchema = z.object({
   replacementContent: z.string().describe("Novo texto substituto"),
 });
 
+const ReadJsonPropertySchema = z.object({
+  filePath: z.string().describe("Caminho absoluto do arquivo JSON"),
+  propertyPath: z.string().describe("Caminho da propriedade (ex: 'dependencies.zod' ou 'scripts.build')"),
+});
+
+const UpdateJsonPropertySchema = z.object({
+  filePath: z.string().describe("Caminho absoluto do arquivo JSON"),
+  propertyPath: z.string().describe("Caminho da propriedade (ex: 'version' ou 'scripts.test')"),
+  value: z.any().describe("Novo valor para a propriedade (pode ser string, número, boolean, objeto ou array)"),
+});
+
+const RunSafeCommandSchema = z.object({
+  command: z.string().describe("O comando exato a ser executado"),
+  cwd: z.string().describe("O diretório de trabalho onde o comando será executado"),
+});
+
 // Registrando as ferramentas disponíveis
 server.setRequestHandler(ListToolsRequestSchema, async () => {
   return {
     tools: [
       {
         name: "list_directory",
-        description: "Lista todos os arquivos e subdiretórios de um diretório, incluindo metadados ricos (tamanho, mtime e extensão).",
+        description: "Lista todos os arquivos e subdiretórios de um diretório, com metadados ricos e cache em memória automático.",
         inputSchema: {
           type: "object",
           properties: {
@@ -96,7 +226,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "read_file_content",
-        description: "Lê o conteúdo em texto de um arquivo específico, com suporte a paginação por linhas.",
+        description: "Lê o conteúdo em texto de um arquivo específico, com suporte a cache e paginação por linhas.",
         inputSchema: {
           type: "object",
           properties: {
@@ -109,7 +239,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "search_files",
-        description: "Busca arquivos pelo nome, de forma recursiva, dentro de um diretório.",
+        description: "Busca arquivos pelo nome, de forma recursiva (ignorando pastas comuns como node_modules).",
         inputSchema: {
           type: "object",
           properties: {
@@ -121,7 +251,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "search_file_content",
-        description: "Busca por conteúdo/texto de forma recursiva dentro de arquivos de texto (grep).",
+        description: "Busca texto de forma recursiva dentro de arquivos de texto (grep inteligente que ignora arquivos binários e sensíveis).",
         inputSchema: {
           type: "object",
           properties: {
@@ -134,7 +264,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "write_file",
-        description: "Cria ou sobrescreve por completo o conteúdo de um arquivo.",
+        description: "Cria ou sobrescreve por completo o conteúdo de um arquivo (invalida caches automaticamente).",
         inputSchema: {
           type: "object",
           properties: {
@@ -146,7 +276,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "edit_file",
-        description: "Realiza a edição pontual de um arquivo, substituindo uma string exata e exclusiva por outra.",
+        description: "Realiza a edição pontual de um arquivo substituindo uma string exclusiva (invalida caches automaticamente).",
         inputSchema: {
           type: "object",
           properties: {
@@ -155,6 +285,51 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             replacementContent: { type: "string", description: "Novo texto substituto" }
           },
           required: ["filePath", "targetContent", "replacementContent"]
+        }
+      },
+      {
+        name: "read_json_property",
+        description: "Lê cirurgicamente uma propriedade específica dentro de um arquivo JSON.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            filePath: { type: "string", description: "Caminho absoluto do arquivo JSON" },
+            propertyPath: { type: "string", description: "Caminho da propriedade usando notação de ponto (ex: 'scripts.build')" }
+          },
+          required: ["filePath", "propertyPath"]
+        }
+      },
+      {
+        name: "update_json_property",
+        description: "Altera ou adiciona cirurgicamente um valor a uma propriedade de um JSON (invalida caches automaticamente).",
+        inputSchema: {
+          type: "object",
+          properties: {
+            filePath: { type: "string", description: "Caminho absoluto do arquivo JSON" },
+            propertyPath: { type: "string", description: "Caminho da propriedade usando notação de ponto (ex: 'dependencies.zod')" },
+            value: { type: "any", description: "Novo valor" }
+          },
+          required: ["filePath", "propertyPath", "value"]
+        }
+      },
+      {
+        name: "get_system_info",
+        description: "Retorna diagnósticos do sistema operacional e do hardware (RAM, plataforma, uptime).",
+        inputSchema: {
+          type: "object",
+          properties: {}
+        }
+      },
+      {
+        name: "run_safe_command",
+        description: "Executa comandos do terminal permitidos de forma segura no ambiente local.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            command: { type: "string", description: "O comando exato a ser rodado (Ex: 'npm test', 'npm run build', 'git status', 'git diff')" },
+            cwd: { type: "string", description: "Diretório de trabalho para execução do comando" }
+          },
+          required: ["command", "cwd"]
         }
       }
     ],
@@ -166,7 +341,11 @@ async function searchRecursive(dir: string, pattern: string, results: string[] =
   try {
     const entries = await fs.readdir(dir, { withFileTypes: true });
     for (const entry of entries) {
+      if (shouldIgnoreDirectory(entry.name)) continue;
       const fullPath = path.join(dir, entry.name);
+      
+      if (isSensitive(fullPath)) continue;
+
       if (entry.name.toLowerCase().includes(pattern.toLowerCase())) {
         results.push(fullPath);
       }
@@ -194,7 +373,11 @@ async function searchContentRecursive(
   try {
     const entries = await fs.readdir(dir, { withFileTypes: true });
     for (const entry of entries) {
+      if (shouldIgnoreDirectory(entry.name)) continue;
       const fullPath = path.join(dir, entry.name);
+      
+      if (isSensitive(fullPath)) continue;
+
       if (entry.isDirectory()) {
         try {
           await searchContentRecursive(fullPath, query, allowedExtensions, results);
@@ -240,11 +423,24 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     if (name === "list_directory") {
       const { dirPath } = ListDirectorySchema.parse(args);
       const validatedDir = validatePath(dirPath);
+
+      // Verificando cache
+      const cached = smartCache.get(validatedDir);
+      if (cached) {
+        return {
+          content: [{ type: "text", text: JSON.stringify(cached, null, 2) }],
+        };
+      }
+
       const entries = await fs.readdir(validatedDir, { withFileTypes: true });
-      
       const files = [];
+      
       for (const e of entries) {
+        if (shouldIgnoreDirectory(e.name)) continue;
         const fullPath = path.join(validatedDir, e.name);
+        
+        if (isSensitive(fullPath)) continue;
+
         let size = 0;
         let mtime = "";
         try {
@@ -263,6 +459,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         });
       }
 
+      smartCache.set(validatedDir, files);
+
       return {
         content: [{ type: "text", text: JSON.stringify(files, null, 2) }],
       };
@@ -271,8 +469,24 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     if (name === "read_file_content") {
       const { filePath, startLine, endLine } = ReadFileSchema.parse(args);
       const validatedFile = validatePath(filePath);
+
+      // Cache para leitura completa
+      const isCompleteRead = startLine === undefined && endLine === undefined;
+      if (isCompleteRead) {
+        const cached = smartCache.get(validatedFile);
+        if (cached) {
+          return {
+            content: [{ type: "text", text: cached }],
+          };
+        }
+      }
+
       const content = await fs.readFile(validatedFile, "utf-8");
       
+      if (isCompleteRead) {
+        smartCache.set(validatedFile, content);
+      }
+
       let output = content;
       if (startLine !== undefined || endLine !== undefined) {
         const lines = content.split(/\r?\n/);
@@ -320,6 +534,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       await fs.mkdir(path.dirname(validatedFile), { recursive: true });
       await fs.writeFile(validatedFile, content, "utf-8");
       
+      // Invalida cache
+      smartCache.invalidate(validatedFile);
+
       return {
         content: [{ type: "text", text: `Arquivo escrito com sucesso em: ${validatedFile}` }],
       };
@@ -342,8 +559,89 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const updatedContent = fileContent.replace(targetContent, replacementContent);
       await fs.writeFile(validatedFile, updatedContent, "utf-8");
       
+      // Invalida cache
+      smartCache.invalidate(validatedFile);
+
       return {
         content: [{ type: "text", text: `Arquivo editado com sucesso. Substituição pontual realizada.` }],
+      };
+    }
+
+    if (name === "read_json_property") {
+      const { filePath, propertyPath } = ReadJsonPropertySchema.parse(args);
+      const validatedFile = validatePath(filePath);
+      
+      // Tenta puxar do cache o arquivo completo
+      let fileContent = smartCache.get(validatedFile);
+      if (!fileContent) {
+        fileContent = await fs.readFile(validatedFile, "utf-8");
+        smartCache.set(validatedFile, fileContent);
+      }
+
+      const json = JSON.parse(fileContent);
+      const value = getNestedProperty(json, propertyPath);
+      
+      return {
+        content: [{ type: "text", text: JSON.stringify(value, null, 2) }],
+      };
+    }
+
+    if (name === "update_json_property") {
+      const { filePath, propertyPath, value } = UpdateJsonPropertySchema.parse(args);
+      const validatedFile = validatePath(filePath);
+      
+      const fileContent = await fs.readFile(validatedFile, "utf-8");
+      const json = JSON.parse(fileContent);
+      
+      setNestedProperty(json, propertyPath, value);
+      const updatedContent = JSON.stringify(json, null, 2);
+      
+      await fs.writeFile(validatedFile, updatedContent, "utf-8");
+      smartCache.invalidate(validatedFile);
+
+      return {
+        content: [{ type: "text", text: `Propriedade '${propertyPath}' do JSON atualizada com sucesso.` }],
+      };
+    }
+
+    if (name === "get_system_info") {
+      const info = {
+        platform: os.platform(),
+        arch: os.arch(),
+        cpuCount: os.cpus().length,
+        totalMemoryGB: (os.totalmem() / 1024 / 1024 / 1024).toFixed(2),
+        freeMemoryGB: (os.freemem() / 1024 / 1024 / 1024).toFixed(2),
+        uptimeHours: (os.uptime() / 3600).toFixed(2),
+        nodeVersion: process.version
+      };
+      return {
+        content: [{ type: "text", text: JSON.stringify(info, null, 2) }],
+      };
+    }
+
+    if (name === "run_safe_command") {
+      const { command, cwd } = RunSafeCommandSchema.parse(args);
+      const cleanCmd = command.trim();
+      
+      if (!ALLOWED_COMMANDS.includes(cleanCmd)) {
+        throw new Error(`Comando rejeitado por segurança. Apenas os seguintes comandos são permitidos: ${ALLOWED_COMMANDS.join(", ")}`);
+      }
+
+      const validatedCwd = validatePath(cwd);
+
+      const runPromise = () => new Promise<string>((resolve, reject) => {
+        exec(cleanCmd, { cwd: validatedCwd }, (error, stdout, stderr) => {
+          if (error) {
+            reject(new Error(`Erro ao executar o comando: ${error.message}\nStderr: ${stderr}`));
+          } else {
+            resolve(stdout || stderr || "Comando executado sem saída de texto.");
+          }
+        });
+      });
+
+      const output = await runPromise();
+      return {
+        content: [{ type: "text", text: output }],
       };
     }
 
