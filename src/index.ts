@@ -11,7 +11,10 @@ import path from "path";
 import { exec, execSync } from "child_process";
 import os from "os";
 import AdmZip from "adm-zip";
-import pdfParse from "pdf-parse";
+import * as pdfParse from "pdf-parse";
+
+// Tratamento especial para import de CommonJS no ESM
+const parsePdf = (pdfParse as any).default || pdfParse;
 
 // Instanciando o Servidor MCP
 const server = new Server(
@@ -754,7 +757,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const validatedFile = validatePath(filePath);
 
       const dataBuffer = await fs.readFile(validatedFile);
-      const pdfData = await pdfParse(dataBuffer);
+      const pdfData = await parsePdf(dataBuffer);
 
       return {
         content: [{ type: "text", text: pdfData.text }],
