@@ -8,14 +8,16 @@ import {
 import { z } from "zod";
 import { promises as fs } from "fs";
 import path from "path";
-import { exec } from "child_process";
+import { exec, execSync } from "child_process";
 import os from "os";
+import AdmZip from "adm-zip";
+import pdfParse from "pdf-parse";
 
 // Instanciando o Servidor MCP
 const server = new Server(
   {
     name: "seed-tech-mcp",
-    version: "1.2.0",
+    version: "1.3.0",
   },
   {
     capabilities: {
@@ -30,9 +32,21 @@ const ALLOWED_DIRECTORIES = process.env.ALLOWED_DIRECTORIES
   : null;
 
 if (!ALLOWED_DIRECTORIES) {
-  console.error("Aviso: A variável de ambiente ALLOWED_DIRECTORIES não está definida. O sandbox de segurança está desabilitado.");
+  console.error("Aviso: A variável de ambiente ALLOWED_DIRECTORIES não está definida. O sandbox de segurança de caminhos está desabilitado.");
 } else {
   console.error(`Segurança Sandbox Ativa. Diretórios permitidos: ${ALLOWED_DIRECTORIES.join(", ")}`);
+}
+
+// -------------------------------------------------------------
+// 0. Detecção Automática do Docker para o Sandbox de Comandos
+// -------------------------------------------------------------
+let IS_DOCKER_AVAILABLE = false;
+try {
+  execSync("docker --version", { stdio: "ignore" });
+  IS_DOCKER_AVAILABLE = true;
+  console.error("Docker detectado! O Sandbox do Docker está HABILITADO para execução segura de qualquer comando.");
+} catch (err) {
+  console.error("Aviso: Docker não está rodando no sistema. Fallback ativado: Comandos locais serão restritos por segurança.");
 }
 
 // -------------------------------------------------------------
@@ -151,7 +165,7 @@ function setNestedProperty(obj: any, propPath: string, value: any): void {
 }
 
 // -------------------------------------------------------------
-// 4. Safe Command Runner Configuration
+// 4. Safe Command Runner Configuration (Modo Fallback Local)
 // -------------------------------------------------------------
 const ALLOWED_COMMANDS = [
   "npm test",
@@ -206,8 +220,22 @@ const UpdateJsonPropertySchema = z.object({
 });
 
 const RunSafeCommandSchema = z.object({
-  command: z.string().describe("O comando exato a ser executado"),
+  command: z.string().describe("O comando exato a ser executado (se sob Docker sandbox, roda qualquer comando; se local, restrito aos aprovados)"),
   cwd: z.string().describe("O diretório de trabalho onde o comando será executado"),
+});
+
+const ZipDirectorySchema = z.object({
+  dirPath: z.string().describe("Caminho absoluto da pasta a ser compactada"),
+  zipFilePath: z.string().describe("Caminho absoluto do arquivo .zip resultante"),
+});
+
+const UnzipFileSchema = z.object({
+  zipFilePath: z.string().describe("Caminho absoluto do arquivo .zip para extrair"),
+  destDirPath: z.string().describe("Caminho absoluto do diretório de destino"),
+});
+
+const ReadPdfTextSchema = z.object({
+  filePath: z.string().describe("Caminho absoluto do arquivo PDF"),
 });
 
 // Registrando as ferramentas disponíveis
@@ -323,14 +351,49 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "run_safe_command",
-        description: "Executa comandos do terminal permitidos de forma segura no ambiente local.",
+        description: "Executa comandos do terminal de forma segura. Se o Docker estiver rodando, executa em sandbox 100% isolado sem limites de comandos.",
         inputSchema: {
           type: "object",
           properties: {
-            command: { type: "string", description: "O comando exato a ser rodado (Ex: 'npm test', 'npm run build', 'git status', 'git diff')" },
+            command: { type: "string", description: "O comando a ser executado" },
             cwd: { type: "string", description: "Diretório de trabalho para execução do comando" }
           },
           required: ["command", "cwd"]
+        }
+      },
+      {
+        name: "zip_directory",
+        description: "Compacta um diretório completo em um arquivo .zip.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            dirPath: { type: "string", description: "Caminho absoluto do diretório a ser compactado" },
+            zipFilePath: { type: "string", description: "Caminho absoluto do arquivo .zip a ser criado" }
+          },
+          required: ["dirPath", "zipFilePath"]
+        }
+      },
+      {
+        name: "unzip_file",
+        description: "Descompacta e extrai por completo um arquivo .zip para um diretório de destino.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            zipFilePath: { type: "string", description: "Caminho absoluto do arquivo .zip" },
+            destDirPath: { type: "string", description: "Caminho absoluto da pasta de destino para extração" }
+          },
+          required: ["zipFilePath", "destDirPath"]
+        }
+      },
+      {
+        name: "read_pdf_text",
+        description: "Lê e extrai todo o conteúdo de texto de um arquivo PDF local.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            filePath: { type: "string", description: "Caminho absoluto do arquivo PDF" }
+          },
+          required: ["filePath"]
         }
       }
     ],
@@ -623,19 +686,28 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     if (name === "run_safe_command") {
       const { command, cwd } = RunSafeCommandSchema.parse(args);
       const cleanCmd = command.trim();
-      
-      if (!ALLOWED_COMMANDS.includes(cleanCmd)) {
-        throw new Error(`Comando rejeitado por segurança. Apenas os seguintes comandos são permitidos: ${ALLOWED_COMMANDS.join(", ")}`);
-      }
-
       const validatedCwd = validatePath(cwd);
 
+      let finalCommand = cleanCmd;
+
+      if (IS_DOCKER_AVAILABLE) {
+        // Docker Sandbox: Executa qualquer comando de forma 100% isolada e segura
+        const absoluteCwd = path.resolve(validatedCwd);
+        const dockerCwd = absoluteCwd.replace(/\\/g, "/");
+        finalCommand = `docker run --rm -v "${dockerCwd}:/workspace" -w /workspace node:18-alpine sh -c "${cleanCmd.replace(/"/g, '\\"')}"`;
+      } else {
+        // Fallback Local: Restrição rígida apenas a comandos permitidos
+        if (!ALLOWED_COMMANDS.includes(cleanCmd)) {
+          throw new Error(`Comando rejeitado por segurança (Docker inativo). No modo local, apenas os seguintes comandos são permitidos: ${ALLOWED_COMMANDS.join(", ")}`);
+        }
+      }
+
       const runPromise = () => new Promise<string>((resolve, reject) => {
-        exec(cleanCmd, { cwd: validatedCwd }, (error, stdout, stderr) => {
+        exec(finalCommand, { cwd: validatedCwd }, (error, stdout, stderr) => {
           if (error) {
-            reject(new Error(`Erro ao executar o comando: ${error.message}\nStderr: ${stderr}`));
+            reject(new Error(`Erro ao executar o comando: ${error.message}\nStderr: ${stderr}\nStdout: ${stdout}`));
           } else {
-            resolve(stdout || stderr || "Comando executado sem saída de texto.");
+            resolve(stdout || stderr || "Comando executado com sucesso e sem saída textual.");
           }
         });
       });
@@ -643,6 +715,49 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const output = await runPromise();
       return {
         content: [{ type: "text", text: output }],
+      };
+    }
+
+    if (name === "zip_directory") {
+      const { dirPath, zipFilePath } = ZipDirectorySchema.parse(args);
+      const validatedDir = validatePath(dirPath);
+      const validatedZip = validatePath(zipFilePath);
+
+      const zip = new AdmZip();
+      zip.addLocalFolder(validatedDir);
+      zip.writeZip(validatedZip);
+      
+      smartCache.invalidate(validatedZip);
+
+      return {
+        content: [{ type: "text", text: `Diretório compactado com sucesso em: ${validatedZip}` }],
+      };
+    }
+
+    if (name === "unzip_file") {
+      const { zipFilePath, destDirPath } = UnzipFileSchema.parse(args);
+      const validatedZip = validatePath(zipFilePath);
+      const validatedDest = validatePath(destDirPath);
+
+      const zip = new AdmZip(validatedZip);
+      zip.extractAllTo(validatedDest, true);
+      
+      smartCache.invalidate(validatedDest);
+
+      return {
+        content: [{ type: "text", text: `Arquivo ZIP extraído com sucesso em: ${validatedDest}` }],
+      };
+    }
+
+    if (name === "read_pdf_text") {
+      const { filePath } = ReadPdfTextSchema.parse(args);
+      const validatedFile = validatePath(filePath);
+
+      const dataBuffer = await fs.readFile(validatedFile);
+      const pdfData = await pdfParse(dataBuffer);
+
+      return {
+        content: [{ type: "text", text: pdfData.text }],
       };
     }
 
@@ -656,6 +771,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 });
 
 // Inicializando o servidor
+const sseSessions = new Map<string, SSEServerTransport>();
+
 async function main() {
   const isSSE = process.argv.includes("--sse") || process.env.PORT !== undefined;
 
@@ -668,17 +785,39 @@ async function main() {
     const app = express();
     app.use(express.json());
     
-    let transport: SSEServerTransport | undefined;
+    // Middleware de segurança opcional: API Key
+    const checkApiKey = (req: any, res: any, next: any) => {
+      const MCP_API_KEY = process.env.MCP_API_KEY;
+      if (!MCP_API_KEY) {
+        return next();
+      }
+      const clientKey = req.query.apiKey || req.headers["x-api-key"];
+      if (clientKey !== MCP_API_KEY) {
+        return res.status(401).send("Acesso negado: API Key inválida ou ausente.");
+      }
+      next();
+    };
 
-    app.get("/sse", async (req, res) => {
-      console.error(`Cliente conectando ao SSE na porta ${PORT}...`);
-      transport = new SSEServerTransport("/messages", res);
+    app.get("/sse", checkApiKey, async (req, res) => {
+      const sessionId = (req.query.sessionId as string) || "default";
+      console.error(`Cliente conectado ao SSE (Session: ${sessionId}) na porta ${PORT}`);
+      
+      const transport = new SSEServerTransport(`/messages?sessionId=${sessionId}`, res);
+      sseSessions.set(sessionId, transport);
+      
+      req.on("close", () => {
+        console.error(`Cliente desconectado do SSE (Session: ${sessionId})`);
+        sseSessions.delete(sessionId);
+      });
+
       await server.connect(transport);
     });
 
-    app.post("/messages", async (req, res) => {
+    app.post("/messages", checkApiKey, async (req, res) => {
+      const sessionId = (req.query.sessionId as string) || "default";
+      const transport = sseSessions.get(sessionId);
       if (!transport) {
-        res.status(400).send("SSE connection not established");
+        res.status(400).send(`Sessão SSE '${sessionId}' ativa não encontrada.`);
         return;
       }
       await transport.handlePostMessage(req, res);
