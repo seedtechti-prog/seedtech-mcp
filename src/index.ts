@@ -1,5 +1,6 @@
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
@@ -656,9 +657,41 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
 // Inicializando o servidor
 async function main() {
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
-  console.error("Seed Tech MCP Server rodando via STDIO...");
+  const isSSE = process.argv.includes("--sse") || process.env.PORT !== undefined;
+
+  if (isSSE) {
+    const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
+    
+    const expressModule = await import("express");
+    const express = expressModule.default;
+    
+    const app = express();
+    app.use(express.json());
+    
+    let transport: SSEServerTransport | undefined;
+
+    app.get("/sse", async (req, res) => {
+      console.error(`Cliente conectando ao SSE na porta ${PORT}...`);
+      transport = new SSEServerTransport("/messages", res);
+      await server.connect(transport);
+    });
+
+    app.post("/messages", async (req, res) => {
+      if (!transport) {
+        res.status(400).send("SSE connection not established");
+        return;
+      }
+      await transport.handlePostMessage(req, res);
+    });
+
+    app.listen(PORT, () => {
+      console.error(`Seed Tech MCP Server rodando via HTTP/SSE em: http://localhost:${PORT}/sse`);
+    });
+  } else {
+    const transport = new StdioServerTransport();
+    await server.connect(transport);
+    console.error("Seed Tech MCP Server rodando via STDIO...");
+  }
 }
 
 main().catch((error) => {
