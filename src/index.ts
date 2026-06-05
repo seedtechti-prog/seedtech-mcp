@@ -47,11 +47,11 @@ if (!ALLOWED_DIRECTORIES) {
 // -------------------------------------------------------------
 let IS_DOCKER_AVAILABLE = false;
 try {
-  execSync("docker --version", { stdio: "ignore" });
+  execSync("docker ps", { stdio: "ignore" });
   IS_DOCKER_AVAILABLE = true;
   console.error("Docker detectado! O Sandbox do Docker está HABILITADO para execução segura de qualquer comando.");
 } catch (err) {
-  console.error("Aviso: Docker não está rodando no sistema. Fallback ativado: Comandos locais serão restritos por segurança.");
+  console.error("Aviso: Docker não está rodando no sistema ou o daemon está inacessível. Fallback ativado: Comandos locais serão restritos por segurança.");
 }
 
 // -------------------------------------------------------------
@@ -96,7 +96,10 @@ function validatePath(targetPath: string): string {
   }
 
   if (ALLOWED_DIRECTORIES) {
-    const isAllowed = ALLOWED_DIRECTORIES.some(dir => resolved.startsWith(dir));
+    const isAllowed = ALLOWED_DIRECTORIES.some(dir => {
+      const relative = path.relative(dir, resolved);
+      return !relative.startsWith('..') && !path.isAbsolute(relative);
+    });
     if (!isAllowed) {
       throw new Error(`Acesso negado: O caminho '${targetPath}' está fora dos diretórios permitidos.`);
     }
@@ -148,6 +151,9 @@ function getNestedProperty(obj: any, propPath: string): any {
   const parts = propPath.split(".");
   let current = obj;
   for (const part of parts) {
+    if (part === "__proto__" || part === "constructor" || part === "prototype") {
+      return undefined;
+    }
     if (current === null || typeof current !== "object" || !(part in current)) {
       return undefined;
     }
@@ -161,12 +167,19 @@ function setNestedProperty(obj: any, propPath: string, value: any): void {
   let current = obj;
   for (let i = 0; i < parts.length - 1; i++) {
     const part = parts[i];
+    if (part === "__proto__" || part === "constructor" || part === "prototype") {
+      throw new Error("Acesso negado: Modificação de protótipo (Prototype Pollution) bloqueada por segurança.");
+    }
     if (!(part in current) || typeof current[part] !== "object" || current[part] === null) {
       current[part] = {};
     }
     current = current[part];
   }
-  current[parts[parts.length - 1]] = value;
+  const lastPart = parts[parts.length - 1];
+  if (lastPart === "__proto__" || lastPart === "constructor" || lastPart === "prototype") {
+    throw new Error("Acesso negado: Modificação de protótipo (Prototype Pollution) bloqueada por segurança.");
+  }
+  current[lastPart] = value;
 }
 
 // -------------------------------------------------------------
@@ -221,6 +234,8 @@ interface DocumentToken {
 }
 
 async function getFilesInDirectory(dir: string, fileList: string[] = []) {
+  // Evitar sobrecarregar a busca semântica em repositórios massivos
+  if (fileList.length >= 200) return fileList;
   try {
     const entries = await fs.readdir(dir, { withFileTypes: true });
     for (const entry of entries) {
@@ -233,7 +248,16 @@ async function getFilesInDirectory(dir: string, fileList: string[] = []) {
         const ext = path.extname(entry.name).toLowerCase();
         const readableExts = [".ts", ".js", ".json", ".md", ".txt", ".html", ".css", ".yml", ".yaml"];
         if (readableExts.includes(ext)) {
-          fileList.push(fullPath);
+          try {
+            const stats = await fs.stat(fullPath);
+            // Ignorar arquivos excessivamente grandes (> 500 KB) para evitar OOM
+            if (stats.size < 500 * 1024) {
+              fileList.push(fullPath);
+            }
+          } catch (e) {
+            // Se falhar no stat, adiciona por precaução
+            fileList.push(fullPath);
+          }
         }
       }
     }
@@ -665,9 +689,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
 
 // Função auxiliar para busca de arquivos pelo nome
 async function searchRecursive(dir: string, pattern: string, results: string[] = []) {
+  if (results.length >= 1000) return results;
   try {
     const entries = await fs.readdir(dir, { withFileTypes: true });
     for (const entry of entries) {
+      if (results.length >= 1000) break;
       if (shouldIgnoreDirectory(entry.name)) continue;
       const fullPath = path.join(dir, entry.name);
       
@@ -697,9 +723,11 @@ async function searchContentRecursive(
   allowedExtensions: string[] | null,
   results: { filePath: string; line: number; text: string }[] = []
 ) {
+  if (results.length >= 1000) return results;
   try {
     const entries = await fs.readdir(dir, { withFileTypes: true });
     for (const entry of entries) {
+      if (results.length >= 1000) break;
       if (shouldIgnoreDirectory(entry.name)) continue;
       const fullPath = path.join(dir, entry.name);
       
@@ -722,7 +750,9 @@ async function searchContentRecursive(
             continue; // Pula binários
           }
           const lines = content.split(/\r?\n/);
-          lines.forEach((lineText, index) => {
+          for (let index = 0; index < lines.length; index++) {
+            if (results.length >= 1000) break;
+            const lineText = lines[index];
             if (lineText.toLowerCase().includes(query.toLowerCase())) {
               results.push({
                 filePath: fullPath,
@@ -730,7 +760,7 @@ async function searchContentRecursive(
                 text: lineText.trim()
               });
             }
-          });
+          }
         } catch (e) {
           // Ignora erros individuais de arquivo
         }
@@ -1005,13 +1035,25 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const validatedDest = validatePath(destDirPath);
 
       const zip = new AdmZip(validatedZip);
-      zip.extractAllTo(validatedDest, true);
+      const resolvedDest = path.resolve(validatedDest);
+
+      // Validação de Zip Slip antes de extrair os arquivos
+      const zipEntries = zip.getEntries();
+      for (const entry of zipEntries) {
+        const targetPath = path.resolve(resolvedDest, entry.entryName);
+        const relative = path.relative(resolvedDest, targetPath);
+        if (relative.startsWith('..') || path.isAbsolute(relative)) {
+          throw new Error(`Segurança: Tentativa de Zip Slip detectada no arquivo ZIP para a entrada: ${entry.entryName}`);
+        }
+      }
+
+      zip.extractAllTo(resolvedDest, true);
       
-      smartCache.invalidate(validatedDest);
-      await logAudit("unzip_file", { zipFilePath: validatedZip, destDirPath: validatedDest }, sessionId);
+      smartCache.invalidate(resolvedDest);
+      await logAudit("unzip_file", { zipFilePath: validatedZip, destDirPath: resolvedDest }, sessionId);
 
       return {
-        content: [{ type: "text", text: `Arquivo ZIP extraído com sucesso em: ${validatedDest}` }],
+        content: [{ type: "text", text: `Arquivo ZIP extraído com sucesso em: ${resolvedDest}` }],
       };
     }
 
